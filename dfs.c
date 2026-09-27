@@ -1,9 +1,9 @@
 /* dfs.c
  *
  * Description: Depth-bounded flip enumeration against the public-key
- *   oracle.  A candidate s is valid iff r = HALF_Q*e0 - A*s (mod q) lies
+ *   oracle. A candidate s is valid iff r = HALF_Q*e0 - A*s (mod q) lies
  *   in {-1,0,1}^N (exact key-generation relation; A converted to the
- *   true coefficient domain).  Candidates are evaluated incrementally
+ *   true coefficient domain). Candidates are evaluated incrementally
  *   in O(N) per node, with early termination; suspects are tried in
  *   file order (the caller sorts them by descending doubt).
  *
@@ -36,7 +36,9 @@ static int nsusp, maxdepth;
 static uint64_t budget, tried;
 
 static int32_t center_q(int64_t v) {
-    v %= Q; if (v < 0) v += Q; if (v > Q / 2) v -= Q;
+    v %= Q;
+    if (v < 0) v += Q;
+    if (v > Q / 2) v -= Q;
     return (int32_t)v;
 }
 
@@ -75,14 +77,25 @@ static int check(void) {
     return 1;
 }
 
-static void export_found(const int32_t *s) {
-    FILE *f = fopen("dfs_found.bin", "wb");
-    fwrite(s, sizeof(int32_t), LL * NN, f); fclose(f);
+static int write_file(const char *path, const int32_t *buf, size_t n) {
+    FILE *f = fopen(path, "wb");
+    if (!f) return -1;
+    int ok = fwrite(buf, sizeof(int32_t), n, f) == n;
+    if (fclose(f) != 0) ok = 0;
+    return ok ? 0 : -1;
+}
+
+/* returns 0 on success; on write failure the caller must not trust the files */
+static int export_found(const int32_t *s) {
     int32_t earr[NN];
     for (int i = 0; i < NN; i++)
         earr[i] = center_q((i == 0 ? HALF_Q : 0) - tvec[i]);
-    f = fopen("dfs_found_e.bin", "wb");
-    fwrite(earr, sizeof(int32_t), NN, f); fclose(f);
+    if (write_file("dfs_found.bin", s, LL * NN) ||
+        write_file("dfs_found_e.bin", earr, NN)) {
+        fprintf(stderr, "error: failed to write dfs_found*.bin\n");
+        return -1;
+    }
+    return 0;
 }
 
 static int32_t cur[LL * NN];
@@ -92,11 +105,17 @@ static inline void apply(int p, int j, int d) {
         tvec[i] = center_q((int64_t)tvec[i] + d * COL[p][j][i]);
 }
 
+static int export_failed = 0;
+
 static int dfs(int idx, int depth) {
     if (tried >= budget) return 0;
     if (depth == 0) {
         tried++;
-        if (check()) { export_found(cur); return 1; }
+        if (check()) {
+            if (export_found(cur))
+                export_failed = 1;
+            return 1;
+        }
         return 0;
     }
     for (int i = idx; i <= nsusp - depth; i++) {
@@ -142,10 +161,19 @@ int main(int argc, char **argv) {
     memcpy(cur, base, sizeof cur);
     compute_t(cur);
     tried = 1;
-    if (check()) { export_found(cur); printf("FOUND depth=0 tried=1\n"); return 0; }
+    if (check()) {
+        if (export_found(cur))
+            return 1;
+        printf("FOUND depth=0 tried=1\n");
+        return 0;
+    }
 
     for (int d = 1; d <= maxdepth && tried < budget; d++) {
-        if (dfs(0, d)) { printf("FOUND depth<=%d tried=%llu\n", d, (unsigned long long)tried); return 0; }
+        if (dfs(0, d)) {
+            if (export_failed) return 1;
+            printf("FOUND depth<=%d tried=%llu\n", d, (unsigned long long)tried);
+            return 0;
+        }
         fprintf(stderr, "depth %d done, tried=%llu\n", d, (unsigned long long)tried);
     }
     printf("NOTFOUND tried=%llu\n", (unsigned long long)tried);

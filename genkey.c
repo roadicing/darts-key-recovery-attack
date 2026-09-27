@@ -20,6 +20,14 @@
 
 extern DRNG_ctx drng_algorithm;   /* defined in sign.c; zero-init => deterministic key */
 
+static int write_file(const char *path, const uint8_t *buf, size_t len) {
+    FILE *f = fopen(path, "wb");
+    if (!f) return -1;
+    int ok = fwrite(buf, 1, len, f) == len;
+    if (fclose(f) != 0) ok = 0;
+    return ok ? 0 : -1;
+}
+
 int main(void) {
     const char *env = getenv("POC_SEED");
     if (env && strlen(env) > 0) {
@@ -35,13 +43,18 @@ int main(void) {
     uint8_t pk[CRYPTO_PUBLICKEYBYTES], sk[CRYPTO_SECRETKEYBYTES];
     crypto_sign_keypair(pk, sk);
 
-    FILE *f = fopen("pk.bin", "wb");
-    fwrite(pk, 1, CRYPTO_PUBLICKEYBYTES, f); fclose(f);
-    f = fopen("sk.bin", "wb");
-    fwrite(sk, 1, CRYPTO_SECRETKEYBYTES, f); fclose(f);
+    if (write_file("pk.bin", pk, CRYPTO_PUBLICKEYBYTES) ||
+        write_file("sk.bin", sk, CRYPTO_SECRETKEYBYTES)) {
+        fprintf(stderr, "error: failed to write pk.bin/sk.bin\n");
+        return 1;
+    }
 
     /* report Hamming weights as a sanity check (truth stays inside sk.bin) */
-    polyvecl A[K]; poly s0; polyvecl_1 s1; polyveck e; uint8_t key[SEEDBYTES];
+    polyvecl A[K];
+    poly s0;
+    polyvecl_1 s1;
+    polyveck e;
+    uint8_t key[SEEDBYTES];
     unpack_sk(A, &s0, &s1, &e, key, sk);
     long w_s = 0, w_e = 0;
     for (int j = 0; j < N; j++) {

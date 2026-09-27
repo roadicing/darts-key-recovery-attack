@@ -4,7 +4,7 @@ recover.py
 
 Description: Recovers the DARTS-128 secret key from the accumulated
   signature statistics (key-adaptive bias separation + tiered oracle
-  search) and repacks it into the reference sk format.  Before
+  search) and repacks it into the reference sk format. Before
   searching, the script estimates whether the signature count is
   sufficient; if it is clearly insufficient, it prints the estimated
   requirement instead of searching.
@@ -17,15 +17,28 @@ Input:  argv[1] = optional data directory (default: current directory);
 
 Output: writes <dir>/recovered_sk.bin (sk.bin format, seed K zeroed)
 """
-import sys, os, re, argparse, subprocess, tempfile, shutil, hashlib
+import argparse
+import hashlib
+import itertools
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+from math import comb
 from statistics import NormalDist
+
 import numpy as np
+
 
 N, L, M, TAU = 512, 2, 1024, 30
 STATES = np.array([-1, 0, 1], dtype=np.int32)
 _ND = NormalDist()
-SIG1 = 28.0  # per-signature per-coordinate spread of the statistic
-             # (scheme constant: depends on TAU and the rounding, not the key)
+
+# per-signature per-coordinate spread of the statistic
+# (scheme constant: depends on TAU and the rounding, not the key)
+SIG1 = 28.0
 
 # search schedule: per-run candidate budgets for the medium/deep tiers and
 # the number of stage-1 models carried into the search
@@ -40,15 +53,17 @@ def Qinv(p):
     return -_ND.inv_cdf(p)
 
 
-# ------------------------------------------------------- sufficiency diagnosis
+# sufficiency diagnosis
 def expected_errors(a, sigma, score):
-    """expected stage-1 decision errors.  The cross-validation score measures
+    """
+    expected stage-1 decision errors. The cross-validation score measures
     this key's mu-misfit variance inflation directly:
         score = 1 + Var(mu - mu_hat) / sigma^2   (from odd/even prediction)
-    so the effective noise is sigma*sqrt(score).  No empirical derating
+    so the effective noise is sigma*sqrt(score). No empirical derating
     constant: the misfit that a global constant would approximate is measured
-    per key, from the data.  (score from half-fits slightly overestimates the
-    full-fit misfit, which is the safe direction for a sufficiency test.)"""
+    per key, from the data. (score from half-fits slightly overestimates the
+    full-fit misfit, which is the safe direction for a sufficiency test.)
+    """
     if a <= 0 or sigma <= 0:
         return float('inf')
     sig_eff = sigma * np.sqrt(max(score, 1.0))
@@ -56,16 +71,19 @@ def expected_errors(a, sigma, score):
 
 
 def posterior_errors(mdl):
-    """expected misclassified positions under the model's own posterior."""
+    """
+    expected misclassified positions under the model's own posterior.
+    """
     return float(np.sum(1 - mdl['prob'].max(axis=1)))
 
 
 def search_capacity(n_suspects, budget):
-    """errors guaranteed correctable within ONE dfs run over n_suspects with
+    """
+    errors guaranteed correctable within ONE dfs run over n_suspects with
     the given budget: the largest e with 1 + sum_{i<=e} C(S,i)*2^i <= budget
-    (the 1 is the base candidate itself).  Worst case over orderings; margin
-    ordering does strictly better in practice."""
-    from math import comb
+    (the 1 is the base candidate itself). Worst case over orderings; margin
+    ordering does strictly better in practice.
+    """
     total, e = 1, 0
     while e < n_suspects:
         cost = comb(n_suspects, e + 1) * (2 ** (e + 1))
@@ -77,18 +95,24 @@ def search_capacity(n_suspects, budget):
 
 
 def required_n(a, sigma, score, n_cur, target):
-    """N at which the expected error count drops to `target`."""
+    """
+    N at which the expected error count drops to `target`.
+    """
     sig_eff = sigma * np.sqrt(max(score, 1.0))
     snr_cur = 0.5 * a / sig_eff
     if snr_cur <= 0:
         return float('inf')
     snr_req = Qinv(target / M)
     return n_cur * (snr_req / snr_cur) ** 2
+
+
 def load_statistics(directory):
-    acc = [np.fromfile(os.path.join(directory, nm), dtype=np.int64).astype(np.float64)
+    acc = [np.fromfile(os.path.join(directory, nm),
+                       dtype=np.int64).astype(np.float64)
            for nm in ('acc_a.bin', 'acc_b.bin')]
     if any(a.size != M for a in acc):
-        raise ValueError('each accumulator must contain exactly 1024 int64 values')
+        raise ValueError(
+            'each accumulator must contain exactly 1024 int64 values')
     # the signature count is estimated from the data itself: the odd/even
     # half-difference is pure noise with per-coordinate variance N*SIG1^2,
     # where SIG1 is the per-signature statistic spread (a scheme constant)
@@ -96,11 +120,15 @@ def load_statistics(directory):
     number = int(round(float(np.var(d, ddof=1)) / SIG1 ** 2))
     if number < 1:
         raise ValueError('accumulators look empty (no signatures collected)')
+    # the halves hold the odd- and even-counter samples of the contiguous
+    # counter range [0, N) that collect always sums completely, so their
+    # sizes differ by at most one sample (odd N)
     na, nb = (number + 1) // 2, number // 2
     xa, xb = -acc[0] / (TAU * na), -acc[1] / (TAU * nb)
     v = float(np.var(xa - xb, ddof=1))
     if not np.isfinite(v) or v <= 0:
-        raise ValueError('split difference has no positive finite noise variance')
+        raise ValueError(
+            'split difference has no positive finite noise variance')
     sa = np.sqrt(v * nb / number)
     sb = np.sqrt(v * na / number)
     sig = np.sqrt(v * na * nb / number ** 2)
@@ -109,11 +137,12 @@ def load_statistics(directory):
     return xa, xb, x, sa, sb, sig, z, number
 
 
-# ------------------------------------------------------- amplitude (a0) prior
+# amplitude (a0) prior
 def highpass(v, K):
-    """remove the lowest K Fourier modes per 512-block."""
+    """
+    remove the DC component and the K lowest Fourier modes per 512-block.
+    """
     out = np.empty_like(v)
-    t = np.arange(N)
     for b in range(L):
         blk = v[b * N:(b + 1) * N]
         f = np.fft.rfft(blk)
@@ -123,7 +152,9 @@ def highpass(v, K):
 
 
 def estimate_amplitude(xa, xb):
-    """cross-spectrum plateau: E[hp(xa).hp(xb)] = a^2 * E[s^2] * frac_kept."""
+    """
+    cross-spectrum plateau: E[hp(xa).hp(xb)] = a^2 * E[s^2] * frac_kept.
+    """
     esp2 = 2 * 0.15  # E[s_j^2] = 2P with public P=0.15
     table = []
     for K in (2, 4, 8, 16, 24, 32, 48, 64, 96, 128):
@@ -138,7 +169,7 @@ def estimate_amplitude(xa, xb):
     return a0, table
 
 
-# ----------------------------------------------------------------- smoothers
+# smoothers
 def _med_1d(v, w, pad='reflect'):
     h = w // 2
     if pad == 'reflect':
@@ -169,10 +200,12 @@ def _combo_1d(K, w):
 
 
 def smoother_pool():
-    """per-block smoothers: (tag, fn on 512-vector).  Both reflect- and
+    """
+    per-block smoothers: (tag, fn on 512-vector). Both reflect- and
     circular-padded medians are included on purpose: mu is not circular, but
     padding-mode diversity makes the models disagree exactly where the mu
-    estimate is contaminated by edge effects or jumps."""
+    estimate is contaminated by edge effects or jumps.
+    """
     pool = [(f'med{w}', (lambda w=w: lambda r: _med_1d(r, w, 'reflect'))())
             for w in (3, 5, 7, 9, 11, 15, 21, 31, 45, 63)]
     pool += [(f'cmed{w}', (lambda w=w: lambda r: _med_1d(r, w, 'circular'))())
@@ -187,7 +220,7 @@ def per_block(fn_pair):
     return lambda r: np.concatenate([f0(r[:N]), f1(r[N:])])
 
 
-# ------------------------------------------------------------ soft-EM (GMM)
+# soft-EM (GMM)
 def posterior(resid, a, rho, sigma):
     z = np.stack([resid + a, resid, resid - a], axis=1)
     ll = -0.5 * (z / sigma) ** 2
@@ -198,7 +231,9 @@ def posterior(resid, a, rho, sigma):
 
 
 def fit_model(values, sigma, smooth, a0=None, max_iter=100):
-    """damped soft-EM over the ternary mixture; smoother supplied as fn."""
+    """
+    damped soft-EM over the ternary mixture; smoother supplied as fn.
+    """
     mu = smooth(values)
     resid = values - mu
     if a0 is not None and np.isfinite(a0) and a0 > 2 * sigma:
@@ -233,9 +268,10 @@ def fit_model(values, sigma, smooth, a0=None, max_iter=100):
 
 
 def select_models(xa, xb, x, sa, sb, sig, a0, rel_thresh=1.07, max_pairs=36):
-    """cross-validate each smoother per block on the odd/even split, then
-    fully fit the best per-block combinations plus every single smoother."""
-    import itertools
+    """
+    cross-validate each smoother per block on the odd/even split, then
+    fully fit the best per-block combinations plus every single smoother.
+    """
     pool = smoother_pool()
     best_per_block = []
     all_scores = []  # per block: full {tag: score}, used for honest ranking
@@ -284,12 +320,14 @@ def select_models(xa, xb, x, sa, sb, sig, a0, rel_thresh=1.07, max_pairs=36):
 
 
 def sufficiency(a, sigma, score, n_cur, post_est, target, e_cap):
-    """expected stage-1 errors vs search capacity.  Two imperfect
+    """
+    expected stage-1 errors vs search capacity. Two imperfect
     indicators are combined: the analytic model can miss mu jumps, the
-    posterior is overconfident on confidently-wrong positions.  Use the
+    posterior is overconfident on confidently-wrong positions. Use the
     pessimistic one for the go-ahead and the optimistic one for giving up:
     SUFFICIENT only when both agree it is safe, INSUFFICIENT only when even
-    the optimistic indicator says the search is hopeless."""
+    the optimistic indicator says the search is hopeless.
+    """
     e_form = expected_errors(a, sigma, score)
     e_opt, e_pes = min(e_form, post_est), max(e_form, post_est)
     n_req = required_n(a, sigma, score, n_cur, target)
@@ -302,10 +340,13 @@ def sufficiency(a, sigma, score, n_cur, post_est, target, e_cap):
     return e_form, e_opt, e_pes, n_req, verdict
 
 
-# ---------------------------------------------------------------- oracle DFS
+# oracle DFS
 def run_oracle(D, dfs_exe, base, suspects, maxdepth, budget):
-    """one dfs run over the suspect set; returns (rec, ee, tried) with
-    rec/ee None when the budget was exhausted without a hit."""
+    """
+    one dfs run over the suspect set; returns (rec, ee, tried) with
+    rec/ee None when the search limits (depth or budget) were reached
+    without a hit.
+    """
     dfs_exe = os.path.abspath(dfs_exe)
     if not os.path.isfile(dfs_exe):
         raise FileNotFoundError(
@@ -316,20 +357,25 @@ def run_oracle(D, dfs_exe, base, suspects, maxdepth, budget):
         sp = os.path.join(tmp, 'susp.bin')
         np.asarray(base, dtype=np.int32).tofile(bp)
         np.asarray(suspects, dtype=np.int32).tofile(sp)
-        r = subprocess.run([dfs_exe, os.path.abspath(os.path.join(D, 'pk.bin')),
+        r = subprocess.run([dfs_exe,
+                            os.path.abspath(os.path.join(D, 'pk.bin')),
                             bp, sp, str(maxdepth), str(budget)],
                            capture_output=True, text=True, cwd=tmp)
         mt = re.search(r'tried=(\d+)', r.stdout)
         tried = int(mt.group(1)) if mt else 0
         if 'FOUND depth' in r.stdout:
-            rec = np.fromfile(os.path.join(tmp, 'dfs_found.bin'), dtype=np.int32)
-            ee = np.fromfile(os.path.join(tmp, 'dfs_found_e.bin'), dtype=np.int32)
-            if rec.size != M or ee.size != N or not np.isin(rec, (-1, 0, 1)).all():
+            rec = np.fromfile(os.path.join(tmp, 'dfs_found.bin'),
+                              dtype=np.int32)
+            ee = np.fromfile(os.path.join(tmp, 'dfs_found_e.bin'),
+                             dtype=np.int32)
+            if (rec.size != M or ee.size != N
+                    or not np.isin(rec, (-1, 0, 1)).all()):
                 raise RuntimeError('dfs returned malformed result files')
             return rec, ee, tried
-        if r.returncode not in (0, 2):  # dfs: 0 = found, 2 = budget exhausted
+        if r.returncode not in (0, 2):  # dfs: 0 = found, 2 = limits reached
+            err = r.stderr.strip()[:300]
             raise RuntimeError(
-                f'dfs exited with code {r.returncode}: {r.stderr.strip()[:300]}')
+                f'dfs exited with code {r.returncode}: {err}')
         return None, None, tried
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
@@ -338,14 +384,15 @@ def run_oracle(D, dfs_exe, base, suspects, maxdepth, budget):
 def poly_p_pack_py(coeffs):
     t = (1 - np.asarray(coeffs, dtype=np.int32)) & 0x3
     t = t.reshape(-1, 4)
-    return (t[:, 0] | (t[:, 1] << 2) | (t[:, 2] << 4) | (t[:, 3] << 6)
-            ).astype(np.uint8).tobytes()
+    packed = t[:, 0] | (t[:, 1] << 2) | (t[:, 2] << 4) | (t[:, 3] << 6)
+    return packed.astype(np.uint8).tobytes()
 
 
-# ---------------------------------------------------------------------- main
+# main
 def main():
-    ap = argparse.ArgumentParser(description=__doc__,
-                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap = argparse.ArgumentParser(
+        description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('data_dir', nargs='?', default='.',
                     help='directory with acc_a.bin/acc_b.bin/pk.bin '
                          '(default: current directory)')
@@ -358,8 +405,8 @@ def main():
 
     xa, xb, x, sa, sb, sig, z, Nsig = load_statistics(D)
     print(f'signatures N ~ {Nsig:,}  (estimated from the accumulators)')
-    print(f'leakage detection: z = {z:+.2f}  (|z| > 3 means significant)')
-    if z < 3.0:
+    print(f'leakage detection: z = {z:+.2f}  (z > 3 means significant)')
+    if z <= 3.0:
         print('signal not significant; collect more signatures.')
         return 2
 
@@ -375,7 +422,7 @@ def main():
     # correctable-error guarantee, computed honestly per round: each dfs call
     # re-enumerates from scratch, so rounds do not compose; the guarantee is
     # the best single-round full-coverage depth over that round's own
-    # suspect-set size and budget.  (round tiers defined below)
+    # suspect-set size and budget. (round tiers defined below)
     tier_specs = [(96, BUDGET1), (96, BUDGET2), (192, 2 * BUDGET2)]
     e_cap = max(search_capacity(s, b) for s, b in tier_specs)
     target = max(1.0, e_cap / 2)
@@ -385,22 +432,23 @@ def main():
         if np.isfinite(n_req):
             print(f'signature count insufficient: estimated need '
                   f'~{n_req:,.0f} (collect ~{max(n_req - Nsig, 0):,.0f} '
-                  f'more and re-run; ./collect resumes from its '
-                  f'checkpoint)')
+                  f'more: rerun ./collect with the larger count and '
+                  f'--load ckpt.bin)')
         else:
             print('signature count insufficient: amplitude too weak to '
                   'extrapolate a requirement; collect much more data')
         return 2
 
-    # ---- suspect set ---------------------------------------------------
+    # suspect set
     # suspicion(j) = max( mean over models of posterior doubt, fraction of
-    # models disagreeing with the plurality vote ).  The disagreement term is
+    # models disagreeing with the plurality vote ). The disagreement term is
     # essential: a mu jump makes every smoother *confidently* wrong (margin
     # 1.0), but different smoother families are wrong at *different* places,
-    # so the vote exposes what the margins hide.  A small per-block edge
+    # so the vote exposes what the margins hide. A small per-block edge
     # allowance is added because median windows are least reliable there.
-    # Disagreement/edge positions are reserved first so the cap can never
-    # truncate them away.
+    # Disagreement/edge positions are placed first, so the cap evicts
+    # low-suspicion positions before them (if the reserved set itself
+    # exceeds the cap, its least-suspicious members are still dropped).
     def build_suspects(models, cap):
         ref = models[0]['s']
         votes = []
@@ -439,7 +487,7 @@ def main():
     # Shallow tiers rotate across ALL models before any model gets a deep
     # budget: the score ranking is imperfect, and on test_data the 2-error
     # model ranks 2nd while the 5-error 1st-ranked model would otherwise
-    # burn 10M candidates at depths it cannot complete.  Depth 2 over 96
+    # burn 10M candidates at depths it cannot complete. Depth 2 over 96
     # suspects costs ~18k candidates per model-sign, so the sweep is cheap.
     # tier list: (label, models, suspect_cap, maxdepth, budget per run)
     tiers = [
@@ -473,8 +521,9 @@ def main():
         print('key not found within the enumeration budget')
         if np.isfinite(n_req) and n_req > Nsig:
             print(f'signature count insufficient: estimated need '
-                  f'~{n_req:,.0f} (collect ~{n_req - Nsig:,.0f} more and '
-                  f're-run; ./collect resumes from its checkpoint)')
+                  f'~{n_req:,.0f} (collect ~{n_req - Nsig:,.0f} more: '
+                  f'rerun ./collect with the larger count and '
+                  f'--load ckpt.bin)')
         else:
             print('diagnosis: the estimate predicted few errors yet the '
                   'search failed; doubling the signature count is the '
@@ -484,17 +533,21 @@ def main():
     pk = open(os.path.join(D, 'pk.bin'), 'rb').read()
     rebuilt = pk + poly_p_pack_py(rec[:N]) + poly_p_pack_py(rec[N:]) + \
         poly_p_pack_py(ee[-N:]) + bytes(32)
-    out = os.path.join(D, 'recovered_sk.bin')
+    out = os.path.normpath(os.path.join(D, 'recovered_sk.bin'))
     open(out, 'wb').write(rebuilt)
     print(f'recovered key written to {out}')
 
     if args.compare_sk:
-        sk_path = os.path.join(D, 'sk.bin')
+        sk_path = os.path.normpath(os.path.join(D, 'sk.bin'))
         if not os.path.isfile(sk_path):
             print(f'note: no sk.bin found in {os.path.abspath(D)}; '
                   f'saved without comparison.')
         else:
             sk = open(sk_path, 'rb').read()
+            if len(sk) != len(rebuilt):
+                print(f'warning: {sk_path} has length {len(sk)}, expected '
+                      f'{len(rebuilt)}; cannot compare')
+                return 1
             cut = len(sk) - 32
             m1 = hashlib.md5(sk[:cut]).hexdigest()
             m2 = hashlib.md5(rebuilt[:cut]).hexdigest()
@@ -504,8 +557,8 @@ def main():
                   f'{"<-- identical" if m1 == m2 else "<-- MISMATCH!"}')
             if m1 != m2:
                 return 1
-            print(f'\nPOC PASSED: the DARTS-128 secret key was fully recovered '
-                  f'from ~{Nsig:,} public signatures alone.')
+            print(f'\nPOC PASSED: the DARTS-128 secret key was fully '
+                  f'recovered from ~{Nsig:,} public signatures alone.')
     return 0
 
 
